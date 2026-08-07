@@ -1,0 +1,96 @@
+# <Product Name> - HOOPS AI Embedded Redistributable Package (Sample README Template)
+
+This file is a sample README to be bundled into the ZIP produced by the
+"Creating a Redistributable Package" procedure below. In an actual
+distribution, replace `<Product Name>` with your real product name and add
+your own support contact information.
+
+This package bundles the binaries, the full Python runtime, and the trained
+model(s) required to run the native application (`<Product Name>`) that
+embeds HOOPS AI. The license key is embedded into the binary at build time,
+so no license key configuration is required on the end-user side.
+
+## Contents
+
+- `bin/` — Built native binaries (executable / shared library)
+- `.venv/` — The minimal set of Python packages required to run HOOPS AI,
+  laid out using the same convention as a normal installation
+  (Linux: `.venv/lib/python3.12/site-packages/`, Windows: `.venv\Lib\site-packages\`)
+  (training/development-only packages are not included)
+- `models/` — Trained model(s) (.ckpt)
+- `samples/` — Sample data for verification (if needed)
+
+`test_client` auto-detects the bundled `.venv` relative to its own location,
+so it is run directly (`bin/test_client` on Linux, `bin\test_client.exe` on
+Windows) without any launcher wrapper or `HOOPS_AI_HOME` setting.
+
+## End-user environment prerequisites (not included in this package)
+
+- **Python 3.12 runtime** (same minor version used at build time, providing
+  `libpython3.12.so.1.0` (Linux) / `python312.dll` (Windows). The `-dev`
+  package or development headers for Python itself are not required —
+  only the runtime is needed. On Windows, install it with the python.org
+  installer so it is registered in the PEP 514 registry; the bridge then
+  auto-detects it and no `HOOPS_AI_PYTHON_HOME` needs to be set)
+- The OS's standard C/C++ runtime (on Linux, `libstdc++`/`libgcc`, usually
+  preinstalled)
+- **For headless (no display) Linux servers**: Xvfb and OpenGL-related
+  libraries (`libglu1-mesa` `libgl1` `libosmesa6` `xvfb`). See the main
+  README for details.
+- The same CPU architecture (e.g., x86_64), OS, and Python build (ABI) as
+  this package
+
+## Usage (verification commands for the packaging engineer)
+
+> **This section shows example commands for the packaging engineer to
+> verify that the distributed package works, not commands for the
+> end user to run directly. In an actual product, do not hand
+> `test_client` to the end user — replace it with `<Product Name>`'s own
+> UI (menu operations, etc.).**
+
+**Windows** (cmd.exe or PowerShell):
+```
+cd redist_package
+rem HOOPS_AI_PYTHON_HOME is optional: if unset, the Python 3.12 install is
+rem auto-detected from the PEP 514 registry. Set it only for unusual setups
+rem where auto-detection fails:
+rem set HOOPS_AI_PYTHON_HOME=<path to your Python 3.12 installation>
+bin\test_client.exe mfr          samples\sample_a.step models\<mfr_checkpoint>.ckpt
+bin\test_client.exe embed        samples\sample_a.step models\<embeddings_checkpoint>.ckpt
+bin\test_client.exe compare      samples\sample_a.step samples\sample_b.step models\<embeddings_checkpoint>.ckpt
+bin\test_client.exe index-add    samples\sample_a.step models\<embeddings_checkpoint>.ckpt
+bin\test_client.exe index-search samples\sample_a.step 5 models\<embeddings_checkpoint>.ckpt
+bin\test_client.exe index-info
+```
+> In PowerShell, set environment variables with `$env:VAR = "value"` instead
+> of `set VAR=value`.
+
+**Linux**:
+```bash
+cd redist_package
+# On a headless (no display) server, start Xvfb and export DISPLAY first
+# (see the main README); e.g.:
+#   Xvfb :99 -screen 0 1280x960x24 & export DISPLAY=:99
+bin/test_client mfr          samples/sample_a.step models/<mfr_checkpoint>.ckpt
+bin/test_client embed        samples/sample_a.step models/<embeddings_checkpoint>.ckpt
+bin/test_client compare      samples/sample_a.step samples/sample_b.step models/<embeddings_checkpoint>.ckpt
+bin/test_client index-add    samples/sample_a.step models/<embeddings_checkpoint>.ckpt
+bin/test_client index-search samples/sample_a.step 5 models/<embeddings_checkpoint>.ckpt
+bin/test_client index-info
+```
+
+## Notes
+
+- This package only runs on an environment whose CPU architecture, OS, and
+  Python ABI version match the environment it was built on.
+- The contents of `.venv/` were created based on a measured list of modules
+  obtained by actually running the features this product uses (in this
+  case, MFR inference and shape embedding computation). If additional
+  features are used in the future, you must re-run the module trace after
+  actually exercising the newly added feature.
+- For third-party libraries (including HOOPS AI/HOOPS Exchange), only use
+  redistribution/licensing terms that have been separately confirmed under
+  the specific conditions of your TPA (partner agreement) with Tech Soft 3D.
+  Also refer to the official Acknowledgments page for the list of
+  dependency licenses:
+  https://docs.techsoft3d.com/hoops/ai/resources/Acknowledgments.html

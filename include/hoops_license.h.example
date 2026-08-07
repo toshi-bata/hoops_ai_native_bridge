@@ -1,0 +1,29 @@
+/*
+--------------------------------------------------
+Tech Soft 3D - Generated Unified License File
+--------------------------------------------------
+
+Template for hoops_license.h.
+
+When building a binary for end-user distribution (i.e. the case where a
+partner embeds the license key into the binary instead of handing the key
+to end users directly), copy this file to `hoops_license.h` in the same
+directory and set the actual license key before building.
+
+  cp hoops_license.h.example hoops_license.h
+  (edit hoops_license.h and set the real key in HOOPS_LICENSE)
+
+hoops_license.h itself is listed in .gitignore, so it is not included in
+the repository through normal commit operations.
+
+This file is always required in order to build test_client, including on a
+development machine: neither the bridge nor test_client reads a license key
+from an environment variable. (tools/trace_modules.py is the one exception,
+being a plain Python script that reads HOOPS_AI_LICENSE itself.)
+*/
+
+#ifndef HOOPS_LICENSE_DEFINED
+#	define HOOPS_LICENSE_DEFINED
+#	define HOOPS_LICENSE "your-license-key-here"
+#	define VISUALIZE_LICENSE HOOPS_LICENSE
+#endif

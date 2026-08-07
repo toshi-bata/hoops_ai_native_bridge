@@ -1,0 +1,58 @@
+# Build artifacts
+/build/
+samples/build/
+*.obj
+*.dll
+*.so
+*.exe
+*.pdb
+
+# Guard against accidentally committing license keys or environment-specific paths
+.env
+.env.*
+*.envrc
+*license*.txt
+*license*.json
+include/hoops_license.h
+
+# Runtime-generated ML/embedding artifacts and logs (not source)
+.hoops_embeddings_temp/
+ml_metrics/
+training_errors.log
+
+# Python virtual environment
+.venv/
+
+
+__pycache__/
+*.pyc
+
+# --- Published redistributable shared libraries (commit these) ---
+# The C ABI shared libraries do not embed a license key (it is supplied at
+# runtime by the caller), so they are safe to publish. Un-ignore them
+# explicitly since they would otherwise be caught by the *.dll/*.so rules
+# above.
+!bin/win64/hoops_ai_bridge.dll
+!bin/linux64/libhoops_ai_bridge.so
+
+# --- Never publish the test client (embeds a license key via
+#     include/hoops_license.h at build time) ---
+bin/win64/test_client.exe
+bin/linux64/test_client
+
+# --- Import library (commit this): hoops_ai_bridge.lib is what an external
+#     project (e.g. a Qt project) needs to link against on Windows. It is
+#     produced separately from bin/win64/ (see ARCHIVE_OUTPUT_DIRECTORY in
+#     CMakeLists.txt) and is not caught by the *.dll/*.exe rules above, so no
+#     explicit un-ignore is needed; only the accompanying .exp/.pdb debug
+#     files are excluded. ---
+lib/win64/*.exp
+lib/win64/*.pdb
+
+# --- Runtime-generated similar-part search index (created next to
+#     test_client when it runs; not a build artifact to publish). The index is
+#     now a directory (<indexDir>/index.faiss, index.meta, model.json,
+#     thumbnails/<stem>.png); the default test_client location is
+#     <exedir>/my_index/. ---
+bin/win64/my_index/
+bin/linux64/my_index/
