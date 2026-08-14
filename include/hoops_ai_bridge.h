@@ -437,6 +437,20 @@ extern "C" {
                                                    bool* outExists,
                                                    char* outErrorMsg, int errorMsgSize);
 
+    // Overrides the base directory used to resolve part thumbnails (PNGs) for the CURRENT and
+    // subsequent lookups. By default the bridge resolves thumbnails under the per-index folder
+    // (<indexBase>/, named after the .faiss file). Some indexes ship their images in a separate
+    // folder that does not follow that convention (e.g. the tutorial's "images_tmcad"); point
+    // this at that folder so HoopsAI_GetPartThumbnailPath / HoopsAI_ListIndexPartsPaged find the
+    // "<parent>/<stem>_white.png" (or legacy "<stem>.png") files there.
+    //   dir: absolute path to the image root. A null or empty string CLEARS the override,
+    //        reverting to the default per-index folder.
+    // The override is automatically cleared whenever HoopsAI_OpenIndex opens a (new) index, so a
+    // client that wants it to persist must re-apply it after each open. No filesystem validation
+    // is performed: a missing folder simply makes thumbnails resolve as "not present".
+    HOOPSAI_API bool HoopsAI_SetThumbnailDir(const char* dir,
+                                              char* outErrorMsg, int errorMsgSize);
+
     // Number of body vectors stored for a single part id in the CURRENT index. Because the bridge
     // stores one vector per body and all bodies of a file share the file path as id, this is the
     // part's body/component count: 1 == single-part file, >= 2 == assembly (the same rule used by

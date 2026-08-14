@@ -171,6 +171,13 @@ int g_indexDim = 0;
 // (a folder named after the index) inside it.
 std::string g_indexBase;
 
+// Optional override for the thumbnail base directory. When non-empty it replaces the default
+// per-index folder (g_indexBase) used to resolve part PNGs. This lets the client point at a
+// separately-distributed image folder (e.g. the tutorial's "images_tmcad") whose layout does
+// not follow the bridge's own <indexBase>/ convention. Cleared whenever a new index is opened
+// so each index starts from its own default; set via HoopsAI_SetThumbnailDir.
+std::string g_thumbnailDirOverride;
+
 void SetError(char* outErrorMsg, int errorMsgSize, const std::string& msg) {
     if (!outErrorMsg || errorMsgSize <= 0) return;
     std::strncpy(outErrorMsg, msg.c_str(), errorMsgSize - 1);
@@ -257,6 +264,8 @@ std::string IndexFaissOf(const std::string& base) {
 // <base>/  : the per-index folder (named after the index); thumbnails are created here
 // lazily on the first add.
 std::string ThumbnailsDirOf(const std::string& base) {
+    if (!g_thumbnailDirOverride.empty())
+        return NormalizeSlashes(g_thumbnailDirOverride);
     return NormalizeSlashes(base);
 }
 
@@ -3076,12 +3085,27 @@ extern "C" HOOPSAI_API bool HoopsAI_OpenIndex(const char* faissFilePath, bool cr
         CloseCurrentIndex();
         g_index = vs; // Keep for the lifetime of the current index (do not transfer refcount)
         g_indexBase = basePath;
+        g_thumbnailDirOverride.clear(); // each index starts from its own default image folder
         g_indexDim = (newDim > 0) ? newDim : kIndexDim;
         ok = true;
     } while (false);
 
     PyGILState_Release(gstate);
     return ok;
+}
+
+extern "C" HOOPSAI_API bool HoopsAI_SetThumbnailDir(const char* dir,
+                                                    char* outErrorMsg, int errorMsgSize) {
+    std::lock_guard<std::mutex> lock(g_pyMutex);
+    if (!g_initialized) {
+        SetError(outErrorMsg, errorMsgSize, "HoopsAI_Initialize was not called");
+        return false;
+    }
+    // An empty/null dir clears the override, reverting to the default per-index image folder.
+    // No filesystem validation here: a missing folder simply yields "thumbnail not present"
+    // (outExists=false) from HoopsAI_GetPartThumbnailPath, exactly like a missing default folder.
+    g_thumbnailDirOverride = (dir && *dir) ? NormalizeSlashes(std::string(dir)) : std::string();
+    return true;
 }
 
 extern "C" HOOPSAI_API bool HoopsAI_CloseIndex(char* outErrorMsg, int errorMsgSize) {
