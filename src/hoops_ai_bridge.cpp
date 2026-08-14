@@ -2226,6 +2226,10 @@ extern "C" HOOPSAI_API bool HoopsAI_AddCADFolderToIndex(const char* const* cadFi
     return ok;
 }
 
+// Defined further below (with the assembly driver); forward-declared so part search can reuse the
+// same load-once Python namespace (g_asmNs) that also hosts run_part_search / run_assembly_search.
+bool EnsureAssemblyModule(std::string& err);
+
 extern "C" HOOPSAI_API bool HoopsAI_SearchIndex(const char* cadFilePath, int topK,
                                                  char* outIds, int outIdsBufSize,
                                                  float* outScores, int maxResults,
@@ -2240,6 +2244,10 @@ extern "C" HOOPSAI_API bool HoopsAI_SearchIndex(const char* cadFilePath, int top
         SetError(outErrorMsg, errorMsgSize, "HoopsAI_LoadEmbeddingsModel was not called");
         return false;
     }
+    if (!cadFilePath || !*cadFilePath) {
+        SetError(outErrorMsg, errorMsgSize, "cadFilePath is empty");
+        return false;
+    }
     if (outResultCount) *outResultCount = 0;
     if (outIds && outIdsBufSize > 0) outIds[0] = '\0';
 
@@ -2247,73 +2255,49 @@ extern "C" HOOPSAI_API bool HoopsAI_SearchIndex(const char* cadFilePath, int top
     bool ok = false;
 
     do {
+        // Require a current index (search_by_shape reloads its vectors from the .faiss file).
+        if (!g_index || g_indexBase.empty()) {
+            SetError(outErrorMsg, errorMsgSize, "no current index: call HoopsAI_OpenIndex first");
+            break;
+        }
+
+        // Route part search through CADSearch.search_by_shape(query, top_k, filters={"kind":"part"})
+        // so the results match the tutorial's demo_HOOPS_Embeddings_retrieval "Option B" exactly.
+        // That high-level pipeline embeds the query body-by-body, over-fetches candidates, applies
+        // the GeometricReranker (embedding + geometry blend) and an oriented-bounding-box size
+        // re-sort for high-confidence hits, and strictly keeps kind=="part" records. The former
+        // low-level path here (ComputeEmbeddingVector averaged all bodies into ONE vector, then ran a
+        // raw FaissVectorStore.query with manual kind post-filtering) skipped the reranking entirely
+        // and therefore diverged from the notebook beyond the exact self-matches.
         std::string err;
-        PyObject* vs = GetSharedIndex(err);
-        if (!vs) {
+        if (!EnsureAssemblyModule(err)) {
             SetError(outErrorMsg, errorMsgSize, err);
             break;
         }
-
-        PyObject* idsObj = PyObject_CallMethod(vs, "get_ids", nullptr);
-        if (!idsObj) {
-            SetError(outErrorMsg, errorMsgSize, "get_ids failed: " + FetchPythonError());
-            break;
-        }
-        Py_ssize_t existingCount = PySequence_Size(idsObj);
-        Py_DECREF(idsObj);
-        if (existingCount == 0) {
-            // Index is empty: return success with 0 results instead of treating it as an error
-            // (same behavior as Web API search_index).
-            ok = true;
+        PyObject* fn = PyDict_GetItemString(g_asmNs, "run_part_search"); // borrowed
+        if (!fn) {
+            SetError(outErrorMsg, errorMsgSize, "run_part_search not found in search module");
             break;
         }
 
-        std::vector<float> vec;
-        if (!ComputeEmbeddingVector(cadFilePath, vec, err)) {
-            SetError(outErrorMsg, errorMsgSize, err);
-            break;
-        }
-
-        // Part search must exclude assemblies (multi-body files). The FAISS store keeps one row per
-        // body but dedups query hits to one per file, so a query for e.g. a nut matches the nut body
-        // that lives INSIDE an assembly and surfaces that assembly file. We drop any hit whose record
-        // metadata carries kind=="assembly" (kind is written per file at registration time, mirroring
-        // the demo_HOOPS_Embeddings_retrieval notebook's filters={"kind":"part"}).
-        //
-        // A native filters={"kind":"part"} query is NOT used because it strictly excludes records that
-        // have no "kind" key, which would return nothing on indexes built before this metadata existed.
-        // Instead we over-fetch and post-filter, keeping legacy (kind-less) records for compatibility.
         const int wantK = topK > 0 ? topK : 1;
-        int fetchK = wantK * 4;
-        if (fetchK < wantK + 32) fetchK = wantK + 32;
-        if (fetchK > static_cast<int>(existingCount)) fetchK = static_cast<int>(existingCount);
-
-        PyObject* pyList = PyList_New(static_cast<Py_ssize_t>(vec.size()));
-        for (size_t i = 0; i < vec.size(); ++i) {
-            PyList_SET_ITEM(pyList, static_cast<Py_ssize_t>(i), PyFloat_FromDouble(vec[i]));
-        }
-        PyObject* queryMethod = PyObject_GetAttrString(vs, "query");
-        if (!queryMethod) {
-            Py_DECREF(pyList);
-            SetError(outErrorMsg, errorMsgSize, "resolve query failed: " + FetchPythonError());
+        const std::string faissPath = IndexFaissOf(g_indexBase);
+        PyObject* args = Py_BuildValue("(Ossi)", g_embedder, faissPath.c_str(), cadFilePath, wantK);
+        if (!args) {
+            SetError(outErrorMsg, errorMsgSize, "build args failed: " + FetchPythonError());
             break;
         }
-        PyObject* argsQuery = Py_BuildValue("(O)", pyList);
-        PyObject* kwargsQuery = Py_BuildValue("{s:i}", "top_k", fetchK);
-        PyObject* hits = PyObject_Call(queryMethod, argsQuery, kwargsQuery);
-        Py_DECREF(argsQuery);
-        Py_DECREF(kwargsQuery);
-        Py_DECREF(queryMethod);
-        Py_DECREF(pyList);
-        if (!hits) {
-            SetError(outErrorMsg, errorMsgSize, "query failed: " + FetchPythonError());
+        PyObject* resultObj = PyObject_CallObject(fn, args);
+        Py_DECREF(args);
+        if (!resultObj) {
+            SetError(outErrorMsg, errorMsgSize, "search failed: " + FetchPythonError());
             break;
         }
 
-        PyObject* seq = PySequence_Fast(hits, "query() result is not a sequence");
-        Py_DECREF(hits);
+        PyObject* seq = PySequence_Fast(resultObj, "search result is not a sequence");
+        Py_DECREF(resultObj);
         if (!seq) {
-            SetError(outErrorMsg, errorMsgSize, "query() result not iterable: " + FetchPythonError());
+            SetError(outErrorMsg, errorMsgSize, "search result not iterable: " + FetchPythonError());
             break;
         }
 
@@ -2322,46 +2306,18 @@ extern "C" HOOPSAI_API bool HoopsAI_SearchIndex(const char* cadFilePath, int top
         int written = 0;
         std::string idsJoined;
         for (Py_ssize_t i = 0; i < n && written < limit; ++i) {
-            PyObject* hit = PySequence_Fast_GET_ITEM(seq, i); // borrowed
-            PyObject* idObj = PyObject_GetAttrString(hit, "id");
-            PyObject* scoreObj = PyObject_GetAttrString(hit, "score");
-            if (!idObj || !scoreObj) {
-                Py_XDECREF(idObj);
-                Py_XDECREF(scoreObj);
-                PyErr_Clear();
-                continue; // Skip invalid elements
-            }
-
-            // Drop assemblies: keep the hit only if its metadata has no kind, or kind != "assembly".
-            bool isAssembly = false;
-            PyObject* metaObj = PyObject_GetAttrString(hit, "metadata");
-            if (metaObj) {
-                if (PyDict_Check(metaObj)) {
-                    PyObject* kindObj = PyDict_GetItemString(metaObj, "kind"); // borrowed
-                    if (kindObj && PyUnicode_Check(kindObj)) {
-                        const char* ks = PyUnicode_AsUTF8(kindObj);
-                        if (ks && std::strcmp(ks, "assembly") == 0) isAssembly = true;
-                    }
-                }
-                Py_DECREF(metaObj);
-            } else {
-                PyErr_Clear();
-            }
-            if (isAssembly) {
-                Py_DECREF(idObj);
-                Py_DECREF(scoreObj);
-                continue;
-            }
-
-            const char* idUtf8 = PyUnicode_AsUTF8(idObj);
+            PyObject* row = PySequence_Fast_GET_ITEM(seq, i); // borrowed; expect a (id, score) tuple
+            if (!PySequence_Check(row) || PySequence_Size(row) < 2) continue;
+            PyObject* idObj = PySequence_GetItem(row, 0);
+            PyObject* scoreObj = PySequence_GetItem(row, 1);
+            const char* idUtf8 = idObj ? PyUnicode_AsUTF8(idObj) : nullptr;
             const std::string idStr = idUtf8 ? idUtf8 : "";
-            const double score = PyFloat_AsDouble(scoreObj);
-            Py_DECREF(idObj);
-            Py_DECREF(scoreObj);
 
             if (!idsJoined.empty()) idsJoined += "\n";
             idsJoined += idStr;
-            if (outScores) outScores[written] = static_cast<float>(score);
+            if (outScores) outScores[written] = static_cast<float>(PyFloat_AsDouble(scoreObj));
+            Py_XDECREF(idObj);
+            Py_XDECREF(scoreObj);
             ++written;
         }
         Py_DECREF(seq);
@@ -2406,6 +2362,50 @@ def _get_matcher(embedder, faiss_path):
     _matcher_cache.clear()   # retain only the most recently used index
     _matcher_cache[key] = m
     return m
+
+# ---- Part search (single-part similarity) -----------------------------------------------------
+# Mirrors the tutorial's demo_HOOPS_Embeddings_retrieval "Option B" (search_by_shape): embed the
+# query body-by-body, retrieve candidates, apply the CADSearch geometric reranker + oriented
+# bounding-box size re-sort, and keep only kind=="part" records. A lightweight CADSearch cache
+# (no rarity-weight build, unlike the assembly matcher) keeps repeat queries on the same index fast.
+_part_searcher_cache = {}
+
+def _get_part_searcher(embedder, faiss_path):
+    import os
+    try:
+        mtime = os.path.getmtime(faiss_path)
+    except OSError:
+        mtime = 0.0
+    key = (faiss_path, mtime)
+    s = _part_searcher_cache.get(key)
+    if s is not None:
+        return s
+    from hoops_ai.ml import CADSearch
+    s = CADSearch(shape_model=embedder)
+    s.load_shape_index(path=faiss_path)
+    _part_searcher_cache.clear()   # retain only the most recently used index
+    _part_searcher_cache[key] = s
+    return s
+
+def run_part_search(embedder, faiss_path, query_path, top_k):
+    s = _get_part_searcher(embedder, faiss_path)
+    # search_by_shape returns List[List[VectorHit]] -- one already-ranked list per unique query
+    # body (filters={"kind":"part"} excludes assemblies, matching the notebook). Flatten across
+    # bodies while preserving rank order and de-duplicating by file id, then cap at top_k.
+    results = s.search_by_shape(query_path, top_k=int(top_k), filters={"kind": "part"})
+    k = int(top_k) if int(top_k) > 0 else 1
+    seen = set()
+    out = []
+    for body_hits in results:
+        for h in body_hits:
+            hid = str(getattr(h, "id", "") or "")
+            if not hid or hid in seen:
+                continue
+            seen.add(hid)
+            out.append((hid, float(getattr(h, "score", 0.0))))
+            if len(out) >= k:
+                return out
+    return out
 
 def run_assembly_search(embedder, faiss_path, query_path, top_k, candidate_k,
                         sim_thresh, bop_weight, coverage_mode, use_idf):
