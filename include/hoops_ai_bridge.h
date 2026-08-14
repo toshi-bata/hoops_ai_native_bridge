@@ -478,6 +478,9 @@ extern "C" {
     //                  parallel to outIds. A part whose thumbnail could not be derived yields an
     //                  empty segment; callers should zip by index (a trailing empty segment may be
     //                  dropped, so treat a missing i-th thumb as empty) and rely on outExists.
+    // outKinds:        newline-delimited "part"/"assembly" strings, positionally parallel to
+    //                  outIds (empty segment when a record has no stored "kind"). Read from record
+    //                  metadata in the same pass as outThumbs, so it adds no measurable cost.
     // outExists:       optional byte array (>= maxResults) receiving 1/0 for each returned part in
     //                  order (whether the thumbnail PNG is present on disk). May be nullptr.
     // maxResults:      capacity of outExists and the hard cap on the number of parts returned.
@@ -488,6 +491,7 @@ extern "C" {
     HOOPSAI_API bool HoopsAI_ListIndexPartsPaged(int offset, int count,
                                                   char* outIds, int outIdsBufSize,
                                                   char* outThumbs, int outThumbsBufSize,
+                                                  char* outKinds, int outKindsBufSize,
                                                   unsigned char* outExists, int maxResults,
                                                   int* outResultCount, int* outTotalCount,
                                                   char* outErrorMsg, int errorMsgSize);

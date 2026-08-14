@@ -3318,6 +3318,7 @@ extern "C" HOOPSAI_API bool HoopsAI_GetPartThumbnailPath(const char* partId,
 extern "C" HOOPSAI_API bool HoopsAI_ListIndexPartsPaged(int offset, int count,
                                                         char* outIds, int outIdsBufSize,
                                                         char* outThumbs, int outThumbsBufSize,
+                                                        char* outKinds, int outKindsBufSize,
                                                         unsigned char* outExists, int maxResults,
                                                         int* outResultCount, int* outTotalCount,
                                                         char* outErrorMsg, int errorMsgSize) {
@@ -3326,6 +3327,7 @@ extern "C" HOOPSAI_API bool HoopsAI_ListIndexPartsPaged(int offset, int count,
     if (outTotalCount) *outTotalCount = 0;
     if (outIds && outIdsBufSize > 0) outIds[0] = '\0';
     if (outThumbs && outThumbsBufSize > 0) outThumbs[0] = '\0';
+    if (outKinds && outKindsBufSize > 0) outKinds[0] = '\0';
 
     if (!g_initialized) {
         SetError(outErrorMsg, errorMsgSize, "HoopsAI_Initialize was not called");
@@ -3356,6 +3358,7 @@ extern "C" HOOPSAI_API bool HoopsAI_ListIndexPartsPaged(int offset, int count,
         // O(1). Doing a LookupThumbFromMetadata per id would re-scan all metadata each time and
         // reintroduce the O(n^2) cost this paged API exists to avoid.
         std::unordered_map<std::string, std::string> thumbRelById;
+        std::unordered_map<std::string, std::string> kindById;
         {
             PyObject* metaIter = PyObject_CallMethod(g_index, "iter_metadata", nullptr);
             if (metaIter) {
@@ -3368,10 +3371,19 @@ extern "C" HOOPSAI_API bool HoopsAI_ListIndexPartsPaged(int offset, int count,
                             PyObject* fid = PyDict_GetItemString(item, "file_id"); // borrowed
                             if (!fid) fid = PyDict_GetItemString(item, "id");      // borrowed
                             PyObject* th = PyDict_GetItemString(item, "thumbnail"); // borrowed
-                            if (fid && PyUnicode_Check(fid) && th && PyUnicode_Check(th)) {
+                            PyObject* kd = PyDict_GetItemString(item, "kind");      // borrowed
+                            if (fid && PyUnicode_Check(fid)) {
                                 const char* f = PyUnicode_AsUTF8(fid);
-                                const char* t = PyUnicode_AsUTF8(th);
-                                if (f && t) thumbRelById.emplace(std::string(f), std::string(t));
+                                if (f) {
+                                    if (th && PyUnicode_Check(th)) {
+                                        const char* t = PyUnicode_AsUTF8(th);
+                                        if (t) thumbRelById.emplace(std::string(f), std::string(t));
+                                    }
+                                    if (kd && PyUnicode_Check(kd)) {
+                                        const char* k = PyUnicode_AsUTF8(kd);
+                                        if (k) kindById.emplace(std::string(f), std::string(k));
+                                    }
+                                }
                             }
                         }
                         Py_DECREF(item);
@@ -3395,7 +3407,7 @@ extern "C" HOOPSAI_API bool HoopsAI_ListIndexPartsPaged(int offset, int count,
         if (maxResults > 0 && end > start + static_cast<Py_ssize_t>(maxResults))
             end = start + static_cast<Py_ssize_t>(maxResults);
 
-        std::string idsJoined, thumbsJoined;
+        std::string idsJoined, thumbsJoined, kindsJoined;
         int written = 0;
         std::error_code ec;
         for (Py_ssize_t i = start; i < end; ++i) {
@@ -3425,6 +3437,8 @@ extern "C" HOOPSAI_API bool HoopsAI_ListIndexPartsPaged(int offset, int count,
             idsJoined += id;
             if (!thumbsJoined.empty()) thumbsJoined += "\n";
             thumbsJoined += thumbPath; // may be empty; parallel to ids by index
+            if (!kindsJoined.empty()) kindsJoined += "\n";
+            { auto ki = kindById.find(id); kindsJoined += (ki != kindById.end()) ? ki->second : std::string(); }
             if (outExists && written < maxResults) outExists[written] = present ? 1 : 0;
             ++written;
         }
@@ -3437,6 +3451,10 @@ extern "C" HOOPSAI_API bool HoopsAI_ListIndexPartsPaged(int offset, int count,
         if (outThumbs && outThumbsBufSize > 0) {
             std::strncpy(outThumbs, thumbsJoined.c_str(), outThumbsBufSize - 1);
             outThumbs[outThumbsBufSize - 1] = '\0';
+        }
+        if (outKinds && outKindsBufSize > 0) {
+            std::strncpy(outKinds, kindsJoined.c_str(), outKindsBufSize - 1);
+            outKinds[outKindsBufSize - 1] = '\0';
         }
         if (outResultCount) *outResultCount = written;
         ok = true;
