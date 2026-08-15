@@ -71,6 +71,7 @@
 #include <cctype>
 #include <fstream>
 #include <ctime>
+#include <atomic>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -405,19 +406,37 @@ std::string DefaultLogPath(const std::string& indexPath) {
     return base + "_addfolder_" + MakeTimestamp() + ".log";
 }
 
+// State shared with the progress callback. Besides deciding whether to draw a sample-side bar, it
+// is used to time the embed_shape_batch phase from the CLIENT side without changing the bridge:
+// the bridge only forwards progress while embed_shape_batch is running (the record-building and
+// FAISS save that follow emit no progress), so the timestamp of the LAST progress callback,
+// relative to the call start, approximates the embed-only elapsed time. The remaining tail (last
+// tqdm tick -> function return) is negligible.
+struct ProgressState {
+    bool drawBar = false;
+    std::chrono::steady_clock::time_point start{};   // set to the call start (== total t0)
+    std::atomic<long long> lastElapsedNs{-1};        // ns from start at the most recent update, -1 = none
+};
+
 // Live progress callback. The bridge calls this from the worker/calling thread (here the same
 // thread that runs HoopsAI_AddCADFolderToIndex), possibly many times per second, so it must stay
-// cheap. userData carries a bool*: whether to DRAW a sample-side bar.
+// cheap. userData carries a ProgressState*.
 //
 // NOTE on the double-bar problem: when a callback is registered, the bridge turns on hoops_ai's
 // own tqdm bar AND mirrors it to the real stderr, so in a console you already see hoops_ai's
 // native bar. Drawing a second bar here would duplicate it. So by default (drawBar == false) this
 // stays silent and only hoops_ai's tqdm bar is shown; the callback still fires (which is what makes
-// the bridge enable that bar) and is where a GUI host would update its own progress widget. Pass
-// --callback-bar to also draw this sample-side bar (useful mainly for a GUI host with no console,
-// where hoops_ai's mirrored stderr is not visible).
+// the bridge enable that bar, and lets us time the embed phase) and is where a GUI host would
+// update its own progress widget. Pass --callback-bar to also draw this sample-side bar (useful
+// mainly for a GUI host with no console, where hoops_ai's mirrored stderr is not visible).
 void FolderAddProgress(int phase, int done, int total, int errors, int heavy, void* userData) {
-    const bool drawBar = userData && *static_cast<const bool*>(userData);
+    auto* state = static_cast<ProgressState*>(userData);
+    if (state) {
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - state->start).count();
+        state->lastElapsedNs.store(ns, std::memory_order_relaxed);
+    }
+    const bool drawBar = state && state->drawBar;
     if (!drawBar) return; // let hoops_ai's own (mirrored) tqdm bar be the sole console progress
 
     const char* label = (phase == 0) ? "Computing embeddings"
@@ -496,19 +515,22 @@ int RunIndexAddFolder(const std::string& folder, const std::string& checkpoint,
     // Register the progress callback BEFORE the call (and clear it after). Registering it is what
     // makes the bridge turn on hoops_ai's own tqdm bar and mirror it to the console; the callback
     // itself only draws a sample-side bar when --callback-bar was given (see FolderAddProgress),
-    // otherwise it stays silent so hoops_ai's native bar is the single progress indicator.
-    bool drawBar = callbackBar;
+    // otherwise it stays silent so hoops_ai's native bar is the single progress indicator. We also
+    // use it to time the embed phase from the client side (see ProgressState).
+    ProgressState progress;
+    progress.drawBar = callbackBar;
     if (callbackBar) {
         std::cout << "  (drawing sample-side progress bar in ADDITION to hoops_ai's tqdm bar)\n";
     } else {
         std::cout << "  (progress shown by hoops_ai's own tqdm bar below)\n";
     }
-    HoopsAI_SetProgressCallback(&FolderAddProgress, &drawBar);
 
     int addedCount = 0, failedCount = 0, indexCount = 0;
     std::vector<char> failedPaths(64 * 1024, '\0');
 
-    const auto t0 = std::chrono::steady_clock::now();
+    progress.start = std::chrono::steady_clock::now();
+    const auto t0 = progress.start;
+    HoopsAI_SetProgressCallback(&FolderAddProgress, &progress);
     const bool ok = HoopsAI_AddCADFolderToIndex(
         ptrs.data(), static_cast<int>(ptrs.size()),
         numWorkers, timeLimitSeconds,
@@ -521,6 +543,12 @@ int RunIndexAddFolder(const std::string& folder, const std::string& checkpoint,
     std::cout << "\n"; // move past the (tqdm and/or sample) progress line
 
     const double elapsed = std::chrono::duration<double>(t1 - t0).count();
+    // Client-side embed-phase estimate: the last progress callback fires when embed_shape_batch is
+    // essentially done, before the record-build + FAISS save tail. -1 means no progress arrived
+    // (e.g. a batch too small/fast to emit a bar), so the embed time is unknown.
+    const long long lastNs = progress.lastElapsedNs.load(std::memory_order_relaxed);
+    const bool haveEmbed = lastNs >= 0;
+    const double embedSeconds = haveEmbed ? (static_cast<double>(lastNs) / 1e9) : 0.0;
 
     // Open the log file: --log <path>, else a timestamped file next to the index. Best-effort:
     // if it cannot be opened we just warn and continue with console-only output.
@@ -542,6 +570,7 @@ int RunIndexAddFolder(const std::string& folder, const std::string& checkpoint,
             log << "folder      : " << folder << "\n";
             log << "index       : " << indexPath << "\n";
             log << "elapsed     : " << elapsed << " s\n";
+            if (haveEmbed) log << "  embed_shape_batch (approx) : " << embedSeconds << " s\n";
             log << "error       : " << errBuf << "\n";
         }
         std::cerr << "AddCADFolderToIndex failed: " << errBuf << "\n";
@@ -574,7 +603,13 @@ int RunIndexAddFolder(const std::string& folder, const std::string& checkpoint,
     emit("  workers        : " + (numWorkers > 0 ? std::to_string(numWorkers) : std::string("auto")));
     emit("  timeout        : " + (timeLimitSeconds > 0 ? std::to_string(timeLimitSeconds) + "s"
                                                         : std::string("default")));
-    emit("  elapsed        : " + std::to_string(elapsed) + " s");
+    emit("  elapsed (total): " + std::to_string(elapsed) + " s  (embed + record build + faiss save)");
+    if (haveEmbed) {
+        emit("    embed_shape_batch (approx, client-timed) : " + std::to_string(embedSeconds) + " s");
+        emit("    build + save (remainder)                 : " + std::to_string(elapsed - embedSeconds) + " s");
+    } else {
+        emit("    embed_shape_batch : n/a (no live progress was reported)");
+    }
     emit("  input files    : " + std::to_string(files.size()));
     emit("  added (success): " + std::to_string(addedCount));
     emit("  failed         : " + std::to_string(failedCount));
