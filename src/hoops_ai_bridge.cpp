@@ -844,15 +844,25 @@ void WriteDiagLog(const std::string& line);
 
 // Bridge-side automatic worker-count selection for a batch embed (used when the caller passes
 // numWorkers <= 0). hoops_ai's own auto-detect (num_workers=None) uses nearly all logical CPUs,
-// but each spawned worker reloads its own copy of the ~2 GB embedding model, so on RAM-bound
-// machines all-core parallelism oversubscribes memory: past ~8 workers throughput DROPS and
-// per-item 120 s timeouts start dropping bodies from the index (data loss). Benchmarks (100
-// mechcad files, 14C/20T / 32 GB) peaked at 8 workers (2.48x vs sequential) and regressed beyond
-// that; all-core auto was 0.78x (slower than sequential). This returns a bounded worker count:
+// but each spawned worker keeps its OWN copy of the ~2 GB embedding model plus the working set of
+// the file it embeds, so peak RSS grows roughly linearly with the worker count. The useful count
+// is therefore bounded by BOTH the physical core count and available RAM: throughput rises to a
+// plateau and then flattens, and once RAM is the bottleneck it can actually decline. Where the
+// plateau sits depends on how heavy the CAD files are -- light single-body parts plateau up around
+// the physical core count, while heavy assemblies (more RAM/IO per worker) plateau BELOW it, so
+// over-subscribing hurts. Two benchmarks of this step both peaked near num_workers=12: a light
+// parts500 set on a 14-physical-core box (flat within ~5% from ~8 up to the core count, no failures
+// to 18) and a heavy mechcad set on a 16-physical-core box (where 16/20/24 workers were
+// progressively SLOWER than even 8 as RSS climbed toward ~37 GB). The exact peak is run-to-run
+// noise, so aim for the plateau, not a single best value. This returns a bounded worker count that
+// stays in that plateau at modest RAM cost:
 //   * 1 for small batches (spawn + per-worker model load is not amortized -- 20 files ran fastest
 //     at 1 worker), otherwise
 //   * min(maxWorkers, logicalCores/2, (availableRAM - reserve) / modelFootprint).
-// All three limits are tunable at runtime (no rebuild) via environment variables:
+// The default cap (maxWorkers=8) is a conservative floor that suits an 8-core laptop and heavy
+// files; on a high-core machine with ample RAM and light files, raise HOOPS_AI_MAX_WORKERS to let
+// the count climb toward the physical core count. All three limits are tunable at runtime (no
+// rebuild) via environment variables:
 //   HOOPS_AI_MAX_WORKERS         (default 8)
 //   HOOPS_AI_MODEL_FOOTPRINT_MB  (default 2048, estimated per-worker model+runtime footprint)
 //   HOOPS_AI_MIN_FILES_PARALLEL  (default 32, below which the batch runs on a single worker)
@@ -1171,10 +1181,10 @@ bool AddPathsBatchCore(PyObject* vs,
 
     // Auto worker selection: numWorkers <= 0 means "let the bridge decide". Resolve it to a
     // bounded count here (see ComputeAutoWorkers) rather than forwarding None to hoops_ai, whose
-    // all-logical-core auto-detect oversubscribes RAM (each worker reloads the ~2 GB model) and,
-    // past ~8 workers, both slows the batch and triggers per-item timeouts that drop bodies. This
-    // only runs when multiprocessing is safe (g_mpConfigured); the clamp above already forced 1
-    // otherwise. An explicit numWorkers > 0 from the caller is always honored as-is.
+    // all-logical-core auto-detect can oversubscribe RAM (each worker reloads the ~2 GB model);
+    // ComputeAutoWorkers keeps the count in the flat throughput plateau near the physical core
+    // count at minimal RAM cost. This only runs when multiprocessing is safe (g_mpConfigured); the
+    // clamp above already forced 1 otherwise. An explicit numWorkers > 0 is always honored as-is.
     if (numWorkers <= 0) {
         numWorkers = ComputeAutoWorkers(fileCount);
         WriteDiagLog("[AddFolder] auto numWorkers=" + std::to_string(numWorkers)
@@ -2127,13 +2137,16 @@ extern "C" HOOPSAI_API bool HoopsAI_AddCADToIndex(const char* cadFilePath,
 // numWorkers: parallel worker processes for embed_shape_batch. <= 0 lets the BRIDGE choose a
 //   bounded worker count (ComputeAutoWorkers: 1 for small batches, else min(cap, cores/2,
 //   availableRAM/model-footprint)); this is the recommended value. It deliberately does NOT
-//   forward None to hoops_ai, whose all-logical-core auto-detect oversubscribes RAM -- each
-//   worker reloads the ~2 GB model -- and past ~8 workers both slows the batch and drops bodies
-//   via per-item timeouts (benchmarked peak was 8 workers, all-core was slower than sequential).
-//   Pass an explicit N > 0 to override. The caps are tunable via HOOPS_AI_MAX_WORKERS /
-//   HOOPS_AI_MODEL_FOOTPRINT_MB / HOOPS_AI_MIN_FILES_PARALLEL. HoopsAI_Initialize repoints
-//   multiprocessing.set_executable() at a real python.exe so spawned workers launch a clean
-//   interpreter instead of relaunching the host; if that setup failed the core clamps to 1.
+//   forward None to hoops_ai, whose all-logical-core auto-detect can oversubscribe RAM -- each
+//   worker keeps its own ~2 GB model copy, so RSS grows ~linearly with the worker count. The
+//   useful count is bounded by both the physical core count and RAM: throughput plateaus and then
+//   flattens (declining once RAM-bound). The plateau is near the physical core count for light
+//   parts but lower for heavy assemblies (two benchmarks of this step both peaked near 12 workers,
+//   and on a 16-core heavy-file run 16/20/24 workers were slower than 8). Aim for that plateau, not
+//   a single best value. Pass an explicit N > 0 to override. The caps are tunable via
+//   HOOPS_AI_MAX_WORKERS / HOOPS_AI_MODEL_FOOTPRINT_MB / HOOPS_AI_MIN_FILES_PARALLEL. HoopsAI_Initialize
+//   repoints multiprocessing.set_executable() at a real python.exe so spawned workers launch a
+//   clean interpreter instead of relaunching the host; if that setup failed the core clamps to 1.
 // Each file is registered under its own path as the id (same default as
 // HoopsAI_AddCADToIndex with partId == nullptr).
 // outAddedCount / outFailedCount: distinct files successfully embedded+added / that failed.

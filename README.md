@@ -528,12 +528,31 @@ each package requires its LICENSE file to be included.
 - **Assembly search runs on the per-body index**, so build the index with the batch add functions before
   calling `HoopsAI_SearchSimilarAssembly`.
 - **Batch worker count.** For `HoopsAI_AddCADFolderToIndex`, `numWorkers <= 0` lets the *bridge* choose a
-  bounded worker count, and that is the recommended value. It deliberately does not delegate to `hoops_ai`'s
-  all-logical-core auto-detect: every spawned worker reloads the embedding model, so all-core parallelism
-  oversubscribes RAM and, past roughly 8 workers, both slows the batch down and drops bodies through
-  per-item timeouts. In benchmarks throughput peaked at 8 workers, and all-core ran slower than sequential.
-  Tunable at runtime via `HOOPS_AI_MAX_WORKERS`, `HOOPS_AI_MODEL_FOOTPRINT_MB` and
-  `HOOPS_AI_MIN_FILES_PARALLEL`.
+  bounded worker count, and that is the recommended default. It deliberately does not delegate to
+  `hoops_ai`'s all-logical-core auto-detect: every spawned worker keeps its **own** copy of the embedding
+  model plus the working set of the file it is embedding, so peak RSS grows roughly linearly with the worker
+  count. The useful worker count is therefore bounded by **both** the physical core count and available RAM,
+  and the throughput-vs-workers curve rises to a plateau and then flattens (and, once RAM is the bottleneck,
+  can actually *decline*).
+
+  Where that plateau sits depends on the machine and, importantly, on how heavy the CAD files are, so treat
+  the numbers below as illustrations of the *shape* of the curve rather than a fixed target:
+    - **Light, mostly single-body parts** let the plateau extend up to about the physical core count. A local
+      benchmark (14 physical / 20 logical cores, 31.7 GB, `parts500`) peaked around `num_workers = 12` with
+      every setting from ~8 up to the core count within ~5 % of peak and no failures up to 18 workers.
+    - **Heavy assemblies** cost more RAM and I/O per worker, so the plateau sits *below* the core count and
+      over-subscribing hurts. An AWS `g6.8xlarge` run (16 physical / 32 logical cores, 121 GB, heavy
+      `mechcad`) also peaked at `num_workers = 12`, but 16/20/24 workers were progressively **slower** than
+      even 8 (24 workers were the slowest of all) while RSS climbed toward ~37 GB.
+
+  Practical guidance that scales from an 8-core laptop to a many-core server: the sweet spot is roughly the
+  physical core count for light parts, and a bit lower (order of ~8–12) for heavy assemblies; adding workers
+  far beyond that only trades RAM for no gain, and can be slower. The exact peak is run-to-run noise, so aim
+  for that plateau rather than a single best value. The simplest choice is to pass `numWorkers <= 0` and let
+  the bridge bound the count (it uses the minimum of a cap, half the logical cores, and available-RAM /
+  per-worker-model-footprint); on a high-core machine with plenty of RAM and light files, raise
+  `HOOPS_AI_MAX_WORKERS` to let it climb toward the core count. All limits are tunable at runtime via
+  `HOOPS_AI_MAX_WORKERS`, `HOOPS_AI_MODEL_FOOTPRINT_MB` and `HOOPS_AI_MIN_FILES_PARALLEL`.
 - **Per-file time budget.** `HoopsAI_AddCADFolderToIndex` takes a `timeLimitSeconds` argument that is passed
   to `embed_shape_batch` as the per-file size-bucket limits (`time_limit_small/medium/large`; `<= 0` keeps
   `hoops_ai`'s 120 s default). A heavy assembly that exceeds the budget is dropped with a *Timeout* and

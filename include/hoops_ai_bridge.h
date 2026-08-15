@@ -244,16 +244,23 @@ extern "C" {
     //            BRIDGE choose a bounded worker count (1 for small batches, otherwise the smaller
     //            of a cap, half the logical cores, and available-RAM / per-worker-model-footprint)
     //            and is the recommended value. It deliberately does not delegate to hoops_ai's own
-    //            all-logical-core auto-detect: because every spawned worker reloads the ~2 GB
-    //            embedding model, all-core parallelism oversubscribes RAM and, past ~8 workers,
-    //            both slows the batch and drops bodies from the index via per-item timeouts
-    //            (benchmarks peaked at 8 workers; all-core ran slower than sequential). The caps
-    //            are tunable at runtime via the HOOPS_AI_MAX_WORKERS, HOOPS_AI_MODEL_FOOTPRINT_MB
-    //            and HOOPS_AI_MIN_FILES_PARALLEL environment variables. HoopsAI_Initialize repoints
-    //            Python's multiprocessing at a real python.exe so these spawn-based workers launch
-    //            a clean interpreter instead of relaunching the host process; if that one-time
-    //            setup failed, the bridge safely clamps to 1 worker. Pass a specific positive value
-    //            only to override the bridge's choice.
+    //            all-logical-core auto-detect: because every spawned worker keeps its OWN ~2 GB
+    //            embedding-model copy (plus the file's working set), peak RSS grows ~linearly with
+    //            the worker count, so the useful count is bounded by BOTH the physical core count
+    //            and available RAM. Throughput rises to a plateau and then flattens, and can
+    //            decline once RAM is the bottleneck. The plateau sits near the physical core count
+    //            for light single-body parts but LOWER for heavy assemblies (more RAM/IO per
+    //            worker): two benchmarks of this step both peaked near 12 workers, and on a 16-core
+    //            heavy-file run 16/20/24 workers were progressively slower than even 8. Aim for that
+    //            plateau -- roughly the physical core count for light parts, order of ~8-12 for
+    //            heavy assemblies -- rather than a single best value; the exact peak is run-to-run
+    //            noise. The caps are tunable at runtime via the HOOPS_AI_MAX_WORKERS,
+    //            HOOPS_AI_MODEL_FOOTPRINT_MB and HOOPS_AI_MIN_FILES_PARALLEL environment variables
+    //            (raise HOOPS_AI_MAX_WORKERS on a high-core machine with ample RAM and light files).
+    //            HoopsAI_Initialize repoints Python's multiprocessing at a real python.exe so these
+    //            spawn-based workers launch a clean interpreter instead of relaunching the host
+    //            process; if that one-time setup failed, the bridge safely clamps to 1 worker. Pass
+    //            a specific positive value only to override the bridge's choice.
     // timeLimitSeconds: per-file embedding time budget passed to embed_shape_batch via the
     //            specifications keys time_limit_overall / time_limit_small / time_limit_medium /
     //            time_limit_large (all set to this value; default 120 s). <= 0 leaves hoops_ai's

@@ -13,6 +13,8 @@
 //   test_client embed        <cad_file> <embeddings_checkpoint.ckpt>
 //   test_client compare      <cad_file_1> <cad_file_2> <embeddings_checkpoint.ckpt>
 //   test_client index-add    <cad_file> <embeddings_checkpoint.ckpt> [--index <basePath>]
+//   test_client index-add-folder <folder> <embeddings_checkpoint.ckpt> [--index <basePath>]
+//                            [--recursive] [--workers N] [--timeout S] [--callback-bar] [--log <file>]
 //   test_client index-search <cad_file> <K> <embeddings_checkpoint.ckpt> [--index <basePath>]
 //   test_client similar-assembly <cad_file> <K> [<embeddings_checkpoint.ckpt>] [--index <basePath>]
 //   test_client index-info   [--index <basePath>]
@@ -64,6 +66,11 @@
 #include <string>
 #include <vector>
 #include <filesystem>
+#include <chrono>
+#include <algorithm>
+#include <cctype>
+#include <fstream>
+#include <ctime>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -326,6 +333,278 @@ int RunIndexAdd(const std::string& cadFile, const std::string& checkpoint,
     return 0;
 }
 
+// --- Folder batch add (HoopsAI_AddCADFolderToIndex) ---------------------------------------
+
+// CAD extensions recognized when scanning a folder. Lower-case, dot-prefixed. The set is
+// intentionally broad; unknown files simply won't be embedded by hoops_ai. Extend as needed.
+bool IsCADExtension(const std::string& extLower) {
+    static const std::vector<std::string> kExts = {
+        ".prt", ".asm", ".sldprt", ".sldasm", ".step", ".stp", ".stpz", ".stpx",
+        ".iges", ".igs", ".catpart", ".catproduct", ".cgr", ".3dxml", ".jt",
+        ".x_t", ".x_b", ".xmt_txt", ".xmt_bin", ".ipt", ".iam", ".par", ".psm",
+        ".model", ".exp", ".dlv", ".session", ".sat", ".sab", ".3ds", ".obj",
+        ".stl", ".3mf", ".fbx", ".gltf", ".glb", ".ifc", ".rvt", ".rfa",
+        ".dwg", ".dxf", ".vda", ".wrl", ".ply", ".u3d", ".prc", ".hsf", ".scz",
+        ".pdf", ".ipj", ".neu", ".xas", ".xpr"
+    };
+    return std::find(kExts.begin(), kExts.end(), extLower) != kExts.end();
+}
+
+std::string ToLower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+// Collect CAD file paths under folder. When recursive is true, descend into subfolders.
+std::vector<std::string> CollectCADFiles(const std::string& folder, bool recursive) {
+    namespace fs = std::filesystem;
+    std::vector<std::string> out;
+    std::error_code ec;
+    auto consider = [&](const fs::directory_entry& e) {
+        if (!e.is_regular_file(ec)) return;
+        const std::string ext = ToLower(e.path().extension().u8string());
+        if (IsCADExtension(ext)) out.push_back(e.path().u8string());
+    };
+    if (recursive) {
+        for (fs::recursive_directory_iterator it(folder, ec), end; it != end; it.increment(ec)) {
+            if (ec) break;
+            consider(*it);
+        }
+    } else {
+        for (fs::directory_iterator it(folder, ec), end; it != end; it.increment(ec)) {
+            if (ec) break;
+            consider(*it);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// Local timestamp as YYYYMMDD_HHMMSS, used for the default log file name.
+std::string MakeTimestamp() {
+    std::time_t t = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[32] = {0};
+    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
+    return std::string(buf);
+}
+
+// Derive the default log path from the index base path: <indexBase>_addfolder_<timestamp>.log,
+// with any trailing ".faiss" stripped from indexPath first (matching the bridge's own rule).
+std::string DefaultLogPath(const std::string& indexPath) {
+    namespace fs = std::filesystem;
+    fs::path p = fs::u8path(indexPath);
+    if (p.extension() == fs::path(".faiss")) p.replace_extension();
+    const std::string base = p.u8string();
+    return base + "_addfolder_" + MakeTimestamp() + ".log";
+}
+
+// Live progress callback. The bridge calls this from the worker/calling thread (here the same
+// thread that runs HoopsAI_AddCADFolderToIndex), possibly many times per second, so it must stay
+// cheap. userData carries a bool*: whether to DRAW a sample-side bar.
+//
+// NOTE on the double-bar problem: when a callback is registered, the bridge turns on hoops_ai's
+// own tqdm bar AND mirrors it to the real stderr, so in a console you already see hoops_ai's
+// native bar. Drawing a second bar here would duplicate it. So by default (drawBar == false) this
+// stays silent and only hoops_ai's tqdm bar is shown; the callback still fires (which is what makes
+// the bridge enable that bar) and is where a GUI host would update its own progress widget. Pass
+// --callback-bar to also draw this sample-side bar (useful mainly for a GUI host with no console,
+// where hoops_ai's mirrored stderr is not visible).
+void FolderAddProgress(int phase, int done, int total, int errors, int heavy, void* userData) {
+    const bool drawBar = userData && *static_cast<const bool*>(userData);
+    if (!drawBar) return; // let hoops_ai's own (mirrored) tqdm bar be the sole console progress
+
+    const char* label = (phase == 0) ? "Computing embeddings"
+                      : (phase == 1) ? "Heavy files (1 worker)"
+                                     : "Working";
+    std::ostringstream oss;
+    oss << "\r  [" << label << "] " << done << "/"
+        << (total > 0 ? std::to_string(total) : std::string("?"));
+    if (total > 0) {
+        int pct = static_cast<int>(100.0 * done / total);
+        // 20-cell ASCII bar
+        int filled = pct / 5;
+        std::string bar(filled, '#');
+        bar.resize(20, '.');
+        oss << " [" << bar << "] " << pct << "%";
+    }
+    if (errors >= 0) oss << " errors=" << errors;
+    if (heavy > 0)   oss << " heavy=" << heavy;
+    oss << "      "; // pad to overwrite a previous longer line
+    std::cout << oss.str() << std::flush;
+}
+
+int RunIndexAddFolder(const std::string& folder, const std::string& checkpoint,
+                      const std::string& indexPath, bool recursive,
+                      int numWorkers, int timeLimitSeconds, bool callbackBar,
+                      const std::string& logPathArg) {
+    namespace fs = std::filesystem;
+    char errBuf[8192] = {0};
+
+    std::error_code ec;
+    if (!fs::is_directory(folder, ec)) {
+        std::cerr << "Not a directory: " << folder << "\n";
+        return 1;
+    }
+
+    std::cout << "[1/6] Scanning folder " << folder
+              << (recursive ? " (recursive) ...\n" : " ...\n");
+    std::vector<std::string> files = CollectCADFiles(folder, recursive);
+    if (files.empty()) {
+        std::cerr << "No CAD files found under " << folder << "\n";
+        return 1;
+    }
+    std::cout << "  found " << files.size() << " CAD file(s)\n";
+
+    std::cout << "[2/6] HoopsAI_Initialize ...\n";
+    if (!InitializeFromEnv(errBuf, sizeof(errBuf))) {
+        std::cerr << "Initialize failed: " << errBuf << "\n";
+        return 1;
+    }
+
+    std::cout << "[3/6] HoopsAI_LoadEmbeddingsModel " << checkpoint << " ...\n";
+    if (!HoopsAI_LoadEmbeddingsModel(checkpoint.c_str(), errBuf, sizeof(errBuf))) {
+        std::cerr << "LoadEmbeddingsModel failed: " << errBuf << "\n";
+        HoopsAI_Shutdown();
+        return 1;
+    }
+
+    std::cout << "[4/6] HoopsAI_OpenIndex " << indexPath << " (createIfMissing=true) ...\n";
+    if (!HoopsAI_OpenIndex(indexPath.c_str(), /*createIfMissing=*/true, errBuf, sizeof(errBuf))) {
+        std::cerr << "OpenIndex failed: " << errBuf << "\n";
+        HoopsAI_Shutdown();
+        return 1;
+    }
+
+    // Build the array of C string pointers the API expects.
+    std::vector<const char*> ptrs;
+    ptrs.reserve(files.size());
+    for (const auto& f : files) ptrs.push_back(f.c_str());
+
+    std::cout << "[5/6] HoopsAI_AddCADFolderToIndex (" << files.size() << " files, workers="
+              << (numWorkers > 0 ? std::to_string(numWorkers) : std::string("auto"))
+              << ", timeout="
+              << (timeLimitSeconds > 0 ? std::to_string(timeLimitSeconds) + "s" : std::string("default"))
+              << ") ...\n";
+
+    // Register the progress callback BEFORE the call (and clear it after). Registering it is what
+    // makes the bridge turn on hoops_ai's own tqdm bar and mirror it to the console; the callback
+    // itself only draws a sample-side bar when --callback-bar was given (see FolderAddProgress),
+    // otherwise it stays silent so hoops_ai's native bar is the single progress indicator.
+    bool drawBar = callbackBar;
+    if (callbackBar) {
+        std::cout << "  (drawing sample-side progress bar in ADDITION to hoops_ai's tqdm bar)\n";
+    } else {
+        std::cout << "  (progress shown by hoops_ai's own tqdm bar below)\n";
+    }
+    HoopsAI_SetProgressCallback(&FolderAddProgress, &drawBar);
+
+    int addedCount = 0, failedCount = 0, indexCount = 0;
+    std::vector<char> failedPaths(64 * 1024, '\0');
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = HoopsAI_AddCADFolderToIndex(
+        ptrs.data(), static_cast<int>(ptrs.size()),
+        numWorkers, timeLimitSeconds,
+        &addedCount, &failedCount,
+        failedPaths.data(), static_cast<int>(failedPaths.size()),
+        &indexCount, errBuf, sizeof(errBuf));
+    const auto t1 = std::chrono::steady_clock::now();
+
+    HoopsAI_SetProgressCallback(nullptr, nullptr);
+    std::cout << "\n"; // move past the (tqdm and/or sample) progress line
+
+    const double elapsed = std::chrono::duration<double>(t1 - t0).count();
+
+    // Open the log file: --log <path>, else a timestamped file next to the index. Best-effort:
+    // if it cannot be opened we just warn and continue with console-only output.
+    const std::string logPath = logPathArg.empty() ? DefaultLogPath(indexPath) : logPathArg;
+    std::ofstream log(fs::u8path(logPath), std::ios::app);
+    if (!log) {
+        std::cerr << "  (warning: could not open log file " << logPath << ")\n";
+    }
+    // Write a line to both the console and the log file (when open).
+    auto emit = [&](const std::string& line) {
+        std::cout << line << "\n";
+        if (log) log << line << "\n";
+    };
+
+    if (!ok) {
+        // Record the failure to the log as well before returning.
+        if (log) {
+            log << "==== AddCADFolderToIndex (FAILED) " << MakeTimestamp() << " ====\n";
+            log << "folder      : " << folder << "\n";
+            log << "index       : " << indexPath << "\n";
+            log << "elapsed     : " << elapsed << " s\n";
+            log << "error       : " << errBuf << "\n";
+        }
+        std::cerr << "AddCADFolderToIndex failed: " << errBuf << "\n";
+        std::cerr << "  elapsed=" << elapsed << "s\n";
+        std::cerr << "  log=" << logPath << "\n";
+        HoopsAI_Shutdown();
+        return 1;
+    }
+
+    // A non-empty errBuf on success is a warning (e.g. aggregated failure reasons), not an error.
+    const std::string warning = errBuf;
+
+    // Split the newline-delimited failed-path list.
+    std::vector<std::string> failed;
+    {
+        std::istringstream iss(failedPaths.data());
+        std::string line;
+        while (std::getline(iss, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (!line.empty()) failed.push_back(line);
+        }
+    }
+
+    std::cout << "[6/6] Done.\n";
+    if (log) log << "==== AddCADFolderToIndex " << MakeTimestamp() << " ====\n";
+    emit("----------------------------------------");
+    emit("  folder         : " + folder + (recursive ? " (recursive)" : ""));
+    emit("  index          : " + indexPath);
+    emit("  checkpoint     : " + checkpoint);
+    emit("  workers        : " + (numWorkers > 0 ? std::to_string(numWorkers) : std::string("auto")));
+    emit("  timeout        : " + (timeLimitSeconds > 0 ? std::to_string(timeLimitSeconds) + "s"
+                                                        : std::string("default")));
+    emit("  elapsed        : " + std::to_string(elapsed) + " s");
+    emit("  input files    : " + std::to_string(files.size()));
+    emit("  added (success): " + std::to_string(addedCount));
+    emit("  failed         : " + std::to_string(failedCount));
+    emit("  index_count    : " + std::to_string(indexCount));
+
+    // Succeeded files = input minus the reported failures (by path).
+    if (!failed.empty()) {
+        emit("  --- failed files ---");
+        for (const auto& f : failed) emit("    [FAIL] " + f);
+    }
+    {
+        std::vector<std::string> succeeded;
+        for (const auto& f : files) {
+            if (std::find(failed.begin(), failed.end(), f) == failed.end())
+                succeeded.push_back(f);
+        }
+        emit("  --- succeeded files (" + std::to_string(succeeded.size()) + ") ---");
+        for (const auto& f : succeeded) emit("    [ OK ] " + f);
+    }
+    if (!warning.empty()) {
+        emit("  --- reason / warning ---");
+        emit("    " + warning);
+    }
+    emit("----------------------------------------");
+    std::cout << "  log written to : " << logPath << "\n";
+
+    HoopsAI_Shutdown();
+    return failedCount > 0 ? 2 : 0;
+}
+
 int RunIndexSearch(const std::string& cadFile, int topK, const std::string& checkpoint,
                    const std::string& indexPath) {
     char errBuf[8192] = {0};
@@ -556,6 +835,8 @@ void PrintUsage(const char* argv0) {
               << "  " << argv0 << " embed        <cad_file> <embeddings_checkpoint.ckpt>\n"
               << "  " << argv0 << " compare      <cad_file_1> <cad_file_2> <embeddings_checkpoint.ckpt>\n"
               << "  " << argv0 << " index-add    <cad_file> <embeddings_checkpoint.ckpt> [--index <basePath>]\n"
+              << "  " << argv0 << " index-add-folder <folder> <embeddings_checkpoint.ckpt> [--index <basePath>]\n"
+              << "                 [--recursive] [--workers N] [--timeout S] [--callback-bar] [--log <file>]\n"
               << "  " << argv0 << " index-search <cad_file> <K> <embeddings_checkpoint.ckpt> [--index <basePath>]\n"
               << "  " << argv0 << " similar-assembly <cad_file> <K> [<embeddings_checkpoint.ckpt>] [--index <basePath>]\n"
               << "  " << argv0 << " index-info   [--index <basePath>]\n"
@@ -569,6 +850,19 @@ void PrintUsage(const char* argv0) {
               << "  index-add renders a white-background thumbnail per part during embedding, into\n"
               << "    <base>/<parent folder of the CAD file>/<file stem>_white.png;\n"
               << "    index-search prints each hit's resolved thumbnail path.\n"
+              << "  index-add-folder scans <folder> for CAD files and registers them in one batch\n"
+              << "    (HoopsAI_AddCADFolderToIndex). It prints, at the end, the elapsed time plus the\n"
+              << "    succeeded / failed file lists and any failure reason. During the batch, progress\n"
+              << "    is shown by hoops_ai's own tqdm bar (the bridge enables and mirrors it while a\n"
+              << "    progress callback is registered); this sample does NOT draw a second bar unless\n"
+              << "    --callback-bar is given, to avoid a duplicated bar in a console. --callback-bar\n"
+              << "    additionally draws the sample's own callback-driven bar (mainly useful for a GUI\n"
+              << "    host with no console, where hoops_ai's mirrored bar is not visible).\n"
+              << "    --recursive descends into subfolders; --workers N sets the parallel worker\n"
+              << "    count (<=0 or omitted = bridge auto); --timeout S sets the per-file embedding\n"
+              << "    budget in seconds (<=0 or omitted = hoops_ai default). The elapsed time plus the\n"
+              << "    succeeded / failed lists and reason are also appended to a log file: --log <file>,\n"
+              << "    or by default <index>_addfolder_<timestamp>.log next to the index.\n"
               << "  similar-assembly ranks whole ASSEMBLIES (not parts) most similar to <cad_file>.\n"
               << "    The checkpoint is optional: needed only when <cad_file> is not already in the\n"
               << "    index (an out-of-corpus query is embedded live); an in-corpus query reuses\n"
@@ -597,6 +891,45 @@ std::string ExtractIndexPath(std::vector<std::string>& args) {
     return DefaultIndexDir();
 }
 
+// Extract a boolean flag (e.g. "--recursive") from args if present, removing it. Returns true
+// when the flag was found.
+bool ExtractFlag(std::vector<std::string>& args, const std::string& flag) {
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == flag) {
+            args.erase(args.begin() + i);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Extract an "--opt <int>" pair from args if present, removing it. Returns defaultValue when
+// the option is not supplied.
+int ExtractIntOption(std::vector<std::string>& args, const std::string& opt, int defaultValue) {
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == opt && i + 1 < args.size()) {
+            int v = std::atoi(args[i + 1].c_str());
+            args.erase(args.begin() + i, args.begin() + i + 2);
+            return v;
+        }
+    }
+    return defaultValue;
+}
+
+// Extract an "--opt <value>" string pair from args if present, removing it. Returns defaultValue
+// when the option is not supplied.
+std::string ExtractStringOption(std::vector<std::string>& args, const std::string& opt,
+                                const std::string& defaultValue) {
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == opt && i + 1 < args.size()) {
+            std::string v = args[i + 1];
+            args.erase(args.begin() + i, args.begin() + i + 2);
+            return v;
+        }
+    }
+    return defaultValue;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -610,6 +943,12 @@ int main(int argc, char** argv) {
     // Collect the remaining args and pull out an optional --index <basePath>.
     std::vector<std::string> rest;
     for (int i = 2; i < argc; ++i) rest.push_back(argv[i]);
+    // Options consumed only by index-add-folder; harmless to extract for other modes.
+    const bool recursive = ExtractFlag(rest, "--recursive");
+    const bool callbackBar = ExtractFlag(rest, "--callback-bar");
+    const int numWorkers = ExtractIntOption(rest, "--workers", 0);
+    const int timeLimitS = ExtractIntOption(rest, "--timeout", 0);
+    const std::string logPath = ExtractStringOption(rest, "--log", "");
     const std::string indexPath = ExtractIndexPath(rest);
 
     if (mode == "mfr" && rest.size() >= 2) {
@@ -620,6 +959,9 @@ int main(int argc, char** argv) {
         return RunCompare(rest[0], rest[1], rest[2]);
     } else if (mode == "index-add" && rest.size() >= 2) {
         return RunIndexAdd(rest[0], rest[1], indexPath);
+    } else if (mode == "index-add-folder" && rest.size() >= 2) {
+        return RunIndexAddFolder(rest[0], rest[1], indexPath, recursive, numWorkers, timeLimitS,
+                                 callbackBar, logPath);
     } else if (mode == "index-search" && rest.size() >= 3) {
         return RunIndexSearch(rest[0], std::atoi(rest[1].c_str()), rest[2], indexPath);
     } else if (mode == "similar-assembly" && rest.size() >= 2) {
