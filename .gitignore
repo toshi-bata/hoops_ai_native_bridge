@@ -20,6 +20,13 @@ include/hoops_license.h
 ml_metrics/
 training_errors.log
 
+# hoops_ai writes this batch error report into the current working directory when
+# embed_shape_batch (HoopsAI_AddCADFolderToIndex) has per-item failures; it is a
+# run artifact, not source. The sample's own summary log (<index>_addfolder_*.log)
+# is written next to the index, not here.
+error_summary.json
+*_addfolder_*.log
+
 # Python virtual environment
 .venv/
 
