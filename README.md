@@ -553,6 +553,15 @@ each package requires its LICENSE file to be included.
   per-worker-model-footprint); on a high-core machine with plenty of RAM and light files, raise
   `HOOPS_AI_MAX_WORKERS` to let it climb toward the core count. All limits are tunable at runtime via
   `HOOPS_AI_MAX_WORKERS`, `HOOPS_AI_MODEL_FOOTPRINT_MB` and `HOOPS_AI_MIN_FILES_PARALLEL`.
+- **Per-worker intra-op threads.** For the duration of each `embed_shape_batch` call only, the bridge pins
+  the spawned workers' math-library intra-op thread count via `OMP_NUM_THREADS`, `MKL_NUM_THREADS`,
+  `OPENBLAS_NUM_THREADS`, `NUMEXPR_NUM_THREADS` and `VECLIB_MAXIMUM_THREADS`, then restores the previous
+  environment. Without this, every worker lets BLAS/OpenMP start one thread per core, so with many workers
+  `workers x cores` threads contend for the same cores. `HOOPS_AI_INTRAOP_THREADS` tunes it at runtime:
+  unset or invalid means `1` (cap on by default), `0` disables the cap (legacy behavior, for A/B testing),
+  and a positive `N` pins `N` threads. Measured via this bridge from `hoops_ai_qt_sandbox` (14-core
+  i9-13900H, 500 files, 14 workers), the single-thread cap cut Pass-1 wall time by roughly 7-10 % (same-day A/B: 439 s -> 407 s). The cap is scoped to
+  the `embed_shape_batch` call so the host's own FAISS/numpy search and shape-map work stay uncapped.
 - **Per-file time budget.** `HoopsAI_AddCADFolderToIndex` takes a `timeLimitSeconds` argument that is passed
   to `embed_shape_batch` as the per-file size-bucket limits (`time_limit_small/medium/large`; `<= 0` keeps
   `hoops_ai`'s 120 s default). A heavy assembly that exceeds the budget is dropped with a *Timeout* and

@@ -1151,6 +1151,94 @@ struct ProgressStderrGuard {
     bool active() const { return installed; }
 };
 
+// The five math-library thread-count variables we pin while embed_shape_batch runs. These are the
+// SAME names the Python similarity-search server uses (embeddings.py intraop_thread_limit() /
+// _INTRAOP_ENV_VARS), so both front-ends behave identically.
+static const char* const kIntraopEnvVars[5] = {
+    "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"
+};
+
+// Read HOOPS_AI_INTRAOP_THREADS: unset => 1 (cap by default), 0 => disabled / do not cap (legacy
+// behavior, kept for A/B comparison), positive N => N, invalid => 1. NOTE: this is intentionally a
+// SEPARATE reader from ComputeAutoWorkers' envInt lambda, which maps any value <= 0 to its default;
+// here 0 is a meaningful value (disable the cap) and must be preserved rather than turned into 1.
+int ReadIntraopThreads() {
+    const char* v = std::getenv("HOOPS_AI_INTRAOP_THREADS");
+    if (!v || !*v) return 1;
+    char* end = nullptr;
+    long n = std::strtol(v, &end, 10);
+    if (end == v || *end != '\0' || n < 0) return 1;
+    return static_cast<int>(n);
+}
+
+// RAII guard that pins every spawned worker's intra-op math threads to a single thread for the
+// DURATION OF THE embed_shape_batch CALL ONLY, then restores the environment. embed_shape_batch
+// spawns worker processes; by default each worker lets BLAS/OpenMP start one thread per core, so
+// (workers x cores) threads contend for the same cores and waste time switching. Pinning each
+// worker to one intra-op thread removed that oversubscription and cut Pass-1 wall time roughly 7-10% on a
+// 14-core i9-13900H (hoops_ai_qt_sandbox via this bridge, 500 files, 14 workers).
+//
+// We set and restore the variables THROUGH Python's os.environ -- not only via C's _putenv /
+// SetEnvironmentVariable -- on purpose: CPython's popen_spawn_win32, on the path that bypasses the
+// venv redirect, builds each child's environment from os.environ.copy(), so a C-only change would
+// not reach those children. Writing os.environ also updates the process environment block, so the
+// child receives the cap on either spawn path.
+//
+// Caller holds the GIL (same precondition as the rest of AddPathsBatchCore). Any Python error is
+// cleared with PyErr_Clear() and the batch simply continues UNCAPPED -- the guard must never fail
+// the embedding.
+struct IntraopThreadsGuard {
+    PyObject* environMap = nullptr;        // os.environ, new reference
+    PyObject* oldVals[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    bool saved[5] = {false, false, false, false, false};
+    bool applied = false;
+
+    IntraopThreadsGuard() {
+        const int threads = ReadIntraopThreads();
+        if (threads <= 0) {
+            // HOOPS_AI_INTRAOP_THREADS=0 -> leave the environment untouched (legacy behavior).
+            WriteDiagLog("[AddFolder] intra-op thread cap disabled (HOOPS_AI_INTRAOP_THREADS=0)");
+            return;
+        }
+        PyObject* osMod = PyImport_ImportModule("os");
+        if (!osMod) { PyErr_Clear(); return; }
+        environMap = PyObject_GetAttrString(osMod, "environ"); // new ref
+        Py_DECREF(osMod);
+        if (!environMap) { PyErr_Clear(); return; }
+        PyObject* val = PyUnicode_FromString(std::to_string(threads).c_str());
+        if (!val) { PyErr_Clear(); Py_CLEAR(environMap); return; }
+        for (int i = 0; i < 5; ++i) {
+            PyObject* key = PyUnicode_FromString(kIntraopEnvVars[i]);
+            if (!key) { PyErr_Clear(); continue; }
+            PyObject* cur = PyObject_GetItem(environMap, key); // new ref, or nullptr if absent
+            if (cur) { oldVals[i] = cur; saved[i] = true; }
+            else { PyErr_Clear(); saved[i] = false; }
+            if (PyObject_SetItem(environMap, key, val) != 0) PyErr_Clear();
+            Py_DECREF(key);
+        }
+        Py_DECREF(val);
+        applied = true;
+        WriteDiagLog("[AddFolder] intra-op thread cap applied threads=" + std::to_string(threads));
+    }
+    ~IntraopThreadsGuard() {
+        if (!applied) return;
+        for (int i = 0; i < 5; ++i) {
+            PyObject* key = PyUnicode_FromString(kIntraopEnvVars[i]);
+            if (!key) { PyErr_Clear(); Py_XDECREF(oldVals[i]); continue; }
+            if (saved[i]) {
+                if (PyObject_SetItem(environMap, key, oldVals[i]) != 0) PyErr_Clear();
+            } else {
+                // The variable did not exist before; remove the one we added.
+                if (PyObject_DelItem(environMap, key) != 0) PyErr_Clear();
+            }
+            Py_XDECREF(oldVals[i]);
+            Py_DECREF(key);
+        }
+        Py_XDECREF(environMap);
+    }
+};
+
 bool AddPathsBatchCore(PyObject* vs,
                        const std::vector<std::string>& inputPaths,
                        const std::unordered_map<std::string, std::string>& idOverride,
@@ -1232,7 +1320,14 @@ bool AddPathsBatchCore(PyObject* vs,
         PyDict_SetItemString(kwargs, "num_workers", nw);
         Py_DECREF(nw);
     }
-    PyObject* batch = PyObject_Call(method, args, kwargs);
+    PyObject* batch = nullptr;
+    {
+        // Cap each spawned worker's intra-op math threads for the DURATION OF THIS CALL ONLY. RAII
+        // restores the environment the moment PyObject_Call returns -- on success, on a Python
+        // exception, or any early return -- so qt's own FAISS/numpy work afterward stays uncapped.
+        IntraopThreadsGuard intraopGuard;
+        batch = PyObject_Call(method, args, kwargs);
+    }
     Py_DECREF(method);
     Py_DECREF(args);   // releases pyPaths
     Py_DECREF(kwargs);
