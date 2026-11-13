@@ -242,21 +242,19 @@ extern "C" {
     //            upsert), so a duplicate is never created.
     // numWorkers: number of parallel worker processes for embed_shape_batch. <= 0 lets the
     //            BRIDGE choose a bounded worker count (1 for small batches, otherwise the smaller
-    //            of a cap, half the logical cores, and available-RAM / per-worker-model-footprint)
+    //            of the logical processor count and available-RAM / per-worker-model-footprint)
     //            and is the recommended value. It deliberately does not delegate to hoops_ai's own
-    //            all-logical-core auto-detect: because every spawned worker keeps its OWN ~2 GB
-    //            embedding-model copy (plus the file's working set), peak RSS grows ~linearly with
-    //            the worker count, so the useful count is bounded by BOTH the physical core count
-    //            and available RAM. Throughput rises to a plateau and then flattens, and can
-    //            decline once RAM is the bottleneck. The plateau sits near the physical core count
-    //            for light single-body parts but LOWER for heavy assemblies (more RAM/IO per
-    //            worker): two benchmarks of this step both peaked near 12 workers, and on a 16-core
-    //            heavy-file run 16/20/24 workers were progressively slower than even 8. Aim for that
-    //            plateau -- roughly the physical core count for light parts, order of ~8-12 for
-    //            heavy assemblies -- rather than a single best value; the exact peak is run-to-run
-    //            noise. The caps are tunable at runtime via the HOOPS_AI_MAX_WORKERS,
-    //            HOOPS_AI_MODEL_FOOTPRINT_MB and HOOPS_AI_MIN_FILES_PARALLEL environment variables
-    //            (raise HOOPS_AI_MAX_WORKERS on a high-core machine with ample RAM and light files).
+    //            all-logical-core auto-detect: because every spawned worker keeps its OWN embedding-
+    //            model copy (plus the file's working set), peak RSS grows ~linearly with the worker
+    //            count, so on a RAM-constrained machine the useful count is bounded by available RAM.
+    //            The bridge pins each worker's intra-op (BLAS/OpenMP) thread count to 1 for the
+    //            duration of the embed_shape_batch call, which removes the per-core thread contention
+    //            that used to cap throughput below the core count; with that in place, throughput
+    //            scales up to the LOGICAL core count (an AWS 16-physical/32-logical run was fastest
+    //            at 32 workers, a 2.25x speedup over the uncapped best). So the bridge defaults to
+    //            min(logicalCores, (availablePhysRAM - totalPhysRAM * 10%) / per-worker-footprint).
+    //            Tunable at runtime via HOOPS_AI_MODEL_FOOTPRINT_MB and HOOPS_AI_MIN_FILES_PARALLEL;
+    //            HOOPS_AI_MAX_WORKERS imposes an optional hard cap only when explicitly set.
     //            HoopsAI_Initialize repoints Python's multiprocessing at a real python.exe so these
     //            spawn-based workers launch a clean interpreter instead of relaunching the host
     //            process; if that one-time setup failed, the bridge safely clamps to 1 worker. Pass

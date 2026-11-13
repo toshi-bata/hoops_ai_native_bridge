@@ -844,28 +844,28 @@ void WriteDiagLog(const std::string& line);
 
 // Bridge-side automatic worker-count selection for a batch embed (used when the caller passes
 // numWorkers <= 0). hoops_ai's own auto-detect (num_workers=None) uses nearly all logical CPUs,
-// but each spawned worker keeps its OWN copy of the ~2 GB embedding model plus the working set of
-// the file it embeds, so peak RSS grows roughly linearly with the worker count. The useful count
-// is therefore bounded by BOTH the physical core count and available RAM: throughput rises to a
-// plateau and then flattens, and once RAM is the bottleneck it can actually decline. Where the
-// plateau sits depends on how heavy the CAD files are -- light single-body parts plateau up around
-// the physical core count, while heavy assemblies (more RAM/IO per worker) plateau BELOW it, so
-// over-subscribing hurts. Two benchmarks of this step both peaked near num_workers=12: a light
-// parts500 set on a 14-physical-core box (flat within ~5% from ~8 up to the core count, no failures
-// to 18) and a heavy mechcad set on a 16-physical-core box (where 16/20/24 workers were
-// progressively SLOWER than even 8 as RSS climbed toward ~37 GB). The exact peak is run-to-run
-// noise, so aim for the plateau, not a single best value. This returns a bounded worker count that
-// stays in that plateau at modest RAM cost:
-//   * 1 for small batches (spawn + per-worker model load is not amortized -- 20 files ran fastest
-//     at 1 worker), otherwise
-//   * min(maxWorkers, logicalCores/2, (availableRAM - reserve) / modelFootprint).
-// The default cap (maxWorkers=8) is a conservative floor that suits an 8-core laptop and heavy
-// files; on a high-core machine with ample RAM and light files, raise HOOPS_AI_MAX_WORKERS to let
-// the count climb toward the physical core count. All three limits are tunable at runtime (no
-// rebuild) via environment variables:
-//   HOOPS_AI_MAX_WORKERS         (default 8)
-//   HOOPS_AI_MODEL_FOOTPRINT_MB  (default 2048, estimated per-worker model+runtime footprint)
+// but each spawned worker keeps its OWN copy of the embedding model plus the working set of the
+// file it embeds, so peak RSS grows roughly linearly with the worker count. Since 58dc899 the
+// bridge pins each worker's intra-op (BLAS/OpenMP) thread count to 1 for the duration of the
+// embed_shape_batch call, which removes the `workers x cores` thread contention that used to make
+// throughput peak well below the core count and then decline. With that cap in place, re-measured
+// throughput keeps rising up to the LOGICAL core count rather than plateauing early: on an AWS
+// g6.8xlarge (16 physical / 32 logical, 121 GB) embedding 10,715 TMCAD files, 32 workers were
+// fastest (1,504.2 s) whereas without the cap 12 workers had been fastest and 16/24/32 only got
+// slower -- a 2.25x speedup between the two best runs, at nearly identical peak RSS. So CPU is no
+// longer the first limit; RAM is. This returns min(logicalCores, memoryCap), matching Pass 1 of
+// the hoops_ai_qt_sandbox desktop app:
+//   memoryCap = max(1, floor((availablePhysRAM - totalPhysRAM * 10%) / perWorkerFootprint))
+// The 10% reserve mirrors hoops_ai's own min_available_ram_percent default (it restarts a worker
+// when free RAM drops below that, and a file that triggers two or more restarts is retried heavy
+// on a single worker). Small batches still run on one worker because the per-worker model load is
+// not amortized. Tunables (runtime, no rebuild):
+//   HOOPS_AI_MAX_WORKERS         (optional hard cap; applied ONLY when explicitly set -- no default)
+//   HOOPS_AI_MODEL_FOOTPRINT_MB  (default 768, estimated per-worker model+runtime footprint)
 //   HOOPS_AI_MIN_FILES_PARALLEL  (default 32, below which the batch runs on a single worker)
+// Memory figures come from GlobalMemoryStatusEx (Windows) or /proc/meminfo MemAvailable/MemTotal
+// (Linux); when neither can be read, the memory cap is skipped and only the logical-core count
+// (and any explicit HOOPS_AI_MAX_WORKERS) bounds the result.
 int ComputeAutoWorkers(int fileCount) {
     auto envInt = [](const char* name, int def) -> int {
         const char* v = std::getenv(name);
@@ -875,33 +875,57 @@ int ComputeAutoWorkers(int fileCount) {
         if (end == v || n <= 0) return def;
         return static_cast<int>(n);
     };
-    const int maxWorkers = envInt("HOOPS_AI_MAX_WORKERS", 8);
-    const int modelMB = envInt("HOOPS_AI_MODEL_FOOTPRINT_MB", 2048);
+    const int modelMB = envInt("HOOPS_AI_MODEL_FOOTPRINT_MB", 768);
     const int minFilesParallel = envInt("HOOPS_AI_MIN_FILES_PARALLEL", 32);
 
     if (fileCount < minFilesParallel) return 1;
 
-    // Core-based cap: half the logical CPUs approximates the physical/performance cores and
-    // avoids E-core / SMT oversubscription (hardware_concurrency() returns 0 when unknown).
+    // Logical processor count (hardware_concurrency() returns 0 when unknown). With the per-worker
+    // intra-op thread cap active, throughput scales to the logical count, so do not halve it.
     unsigned hw = std::thread::hardware_concurrency();
-    int coreCap = (hw >= 2u) ? static_cast<int>(hw / 2u) : 1;
+    int n = (hw >= 1u) ? static_cast<int>(hw) : 1;
 
-    // RAM-based cap: every worker keeps its own model copy, so bound by available physical RAM
-    // minus a reserve for the host process and OS.
-    int ramCap = maxWorkers;
+    // Memory cap: every worker keeps its own model copy, so bound by available physical RAM after
+    // reserving 10% of total RAM for the host process and OS. Applied only when the OS figures read.
+    unsigned long long availBytes = 0ull, totalBytes = 0ull;
 #if defined(_WIN32)
     MEMORYSTATUSEX ms; ms.dwLength = sizeof(ms);
     if (GlobalMemoryStatusEx(&ms)) {
-        const unsigned long long reserveBytes = 2ull * 1024 * 1024 * 1024; // 2 GB host/OS reserve
-        unsigned long long avail = (ms.ullAvailPhys > reserveBytes) ? (ms.ullAvailPhys - reserveBytes) : 0ull;
-        unsigned long long perWorker = static_cast<unsigned long long>(modelMB) * 1024ull * 1024ull;
-        if (perWorker > 0ull) ramCap = static_cast<int>(avail / perWorker);
+        availBytes = ms.ullAvailPhys;
+        totalBytes = ms.ullTotalPhys;
+    }
+#else
+    {
+        std::ifstream meminfo("/proc/meminfo");
+        std::string line;
+        while (std::getline(meminfo, line)) {
+            if (line.compare(0, 13, "MemAvailable:") == 0) {
+                availBytes = std::strtoull(line.c_str() + 13, nullptr, 10) * 1024ull; // kB -> bytes
+            } else if (line.compare(0, 9, "MemTotal:") == 0) {
+                totalBytes = std::strtoull(line.c_str() + 9, nullptr, 10) * 1024ull;  // kB -> bytes
+            }
+        }
     }
 #endif
+    if (availBytes > 0ull && totalBytes > 0ull) {
+        const unsigned long long reserveBytes = totalBytes / 10ull; // reserve 10% of total RAM
+        const unsigned long long usable = (availBytes > reserveBytes) ? (availBytes - reserveBytes) : 0ull;
+        const unsigned long long perWorker = static_cast<unsigned long long>(modelMB) * 1024ull * 1024ull;
+        int memCap = 1;
+        if (perWorker > 0ull) {
+            const unsigned long long c = usable / perWorker;
+            memCap = (c < 1ull) ? 1 : static_cast<int>(c);
+        }
+        if (memCap < n) n = memCap;
+    }
 
-    int n = maxWorkers;
-    if (coreCap < n) n = coreCap;
-    if (ramCap < n) n = ramCap;
+    // Optional hard cap: honored only when HOOPS_AI_MAX_WORKERS is explicitly set.
+    const char* maxEnv = std::getenv("HOOPS_AI_MAX_WORKERS");
+    if (maxEnv && *maxEnv) {
+        const int maxWorkers = envInt("HOOPS_AI_MAX_WORKERS", 0);
+        if (maxWorkers > 0 && maxWorkers < n) n = maxWorkers;
+    }
+
     if (n < 1) n = 1;
     return n;
 }

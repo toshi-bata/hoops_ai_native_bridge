@@ -15,6 +15,11 @@ your own binaries.
 > models as-is. Use this repository as a reference for building your own bridge, keeping the features your
 > product needs and adding your own.
 
+For the background and design discussion behind this bridge, see
+[Using HOOPS AI from a Fully Local Desktop Application](https://forum.techsoft3d.com/t/using-hoops-ai-from-a-fully-local-desktop-application/5200),
+and for an application built on it,
+[HOOPS AI Inside a HOOPS Visualize Desktop + Exchange Application](https://forum.techsoft3d.com/t/hoops-ai-inside-a-hoops-visualize-desktop-exchange-application-similar-part-search-across-10-000-cad-files/5203).
+
 ## What has been verified
 
 - MFR (per-face feature classification), shape similarity, similar-part search (FAISS), and
@@ -531,28 +536,25 @@ each package requires its LICENSE file to be included.
   bounded worker count, and that is the recommended default. It deliberately does not delegate to
   `hoops_ai`'s all-logical-core auto-detect: every spawned worker keeps its **own** copy of the embedding
   model plus the working set of the file it is embedding, so peak RSS grows roughly linearly with the worker
-  count. The useful worker count is therefore bounded by **both** the physical core count and available RAM,
-  and the throughput-vs-workers curve rises to a plateau and then flattens (and, once RAM is the bottleneck,
-  can actually *decline*).
+  count. Since the bridge started pinning each worker's intra-op threads to 1 for the duration of the
+  `embed_shape_batch` call (see *Per-worker intra-op threads* below), the per-core thread contention that
+  used to cap throughput well below the core count is gone, and re-measured throughput scales up to the
+  **logical** core count. On an AWS `g6.8xlarge` (16 physical / 32 logical, 121 GB) embedding 10,715 TMCAD
+  files, 32 workers were fastest at **1,504.2 s** — a **2.25×** speedup over the uncapped best (12 workers,
+  3,377.6 s), at nearly identical peak RSS. CPU is therefore no longer the first limit; **RAM is**.
 
-  Where that plateau sits depends on the machine and, importantly, on how heavy the CAD files are, so treat
-  the numbers below as illustrations of the *shape* of the curve rather than a fixed target:
-    - **Light, mostly single-body parts** let the plateau extend up to about the physical core count. A local
-      benchmark (14 physical / 20 logical cores, 31.7 GB, `parts500`) peaked around `num_workers = 12` with
-      every setting from ~8 up to the core count within ~5 % of peak and no failures up to 18 workers.
-    - **Heavy assemblies** cost more RAM and I/O per worker, so the plateau sits *below* the core count and
-      over-subscribing hurts. An AWS `g6.8xlarge` run (16 physical / 32 logical cores, 121 GB, heavy
-      `mechcad`) also peaked at `num_workers = 12`, but 16/20/24 workers were progressively **slower** than
-      even 8 (24 workers were the slowest of all) while RSS climbed toward ~37 GB.
-
-  Practical guidance that scales from an 8-core laptop to a many-core server: the sweet spot is roughly the
-  physical core count for light parts, and a bit lower (order of ~8–12) for heavy assemblies; adding workers
-  far beyond that only trades RAM for no gain, and can be slower. The exact peak is run-to-run noise, so aim
-  for that plateau rather than a single best value. The simplest choice is to pass `numWorkers <= 0` and let
-  the bridge bound the count (it uses the minimum of a cap, half the logical cores, and available-RAM /
-  per-worker-model-footprint); on a high-core machine with plenty of RAM and light files, raise
-  `HOOPS_AI_MAX_WORKERS` to let it climb toward the core count. All limits are tunable at runtime via
-  `HOOPS_AI_MAX_WORKERS`, `HOOPS_AI_MODEL_FOOTPRINT_MB` and `HOOPS_AI_MIN_FILES_PARALLEL`.
+  So the bridge now defaults to `min(logicalCores, memoryCap)`, matching Pass 1 of the
+  `hoops_ai_qt_sandbox` desktop app, where
+  `memoryCap = max(1, floor((availablePhysRAM − totalPhysRAM × 10%) / perWorkerFootprint))`. The 10% reserve
+  mirrors `hoops_ai`'s own `min_available_ram_percent` default. The per-worker footprint defaults to 768 MB
+  (`HOOPS_AI_MODEL_FOOTPRINT_MB`); `HOOPS_AI_MIN_FILES_PARALLEL` (default 32) keeps small batches on a single
+  worker; and `HOOPS_AI_MAX_WORKERS` imposes an optional hard cap only when explicitly set (there is no
+  longer a default cap). Memory figures come from `GlobalMemoryStatusEx` (Windows) or `/proc/meminfo`
+  (Linux); when neither can be read, only the logical-core count bounds the result. (Earlier, *before* the
+  intra-op cap, the curve peaked much lower — `parts500` was fastest at 12 workers and the AWS run got
+  slower at 16/20/24 as RSS climbed toward ~37 GB — but that was the uncapped behavior and no longer holds.)
+  Detailed worker-count and thread measurements are in
+  [GPU vs CPU for the HOOPS AI Embeddings Pipeline](https://forum.techsoft3d.com/t/gpu-vs-cpu-for-the-hoops-ai-embeddings-pipeline-the-numbers-and-a-2-25x-indexing-fix/5253).
 - **Per-worker intra-op threads.** For the duration of each `embed_shape_batch` call only, the bridge pins
   the spawned workers' math-library intra-op thread count via `OMP_NUM_THREADS`, `MKL_NUM_THREADS`,
   `OPENBLAS_NUM_THREADS`, `NUMEXPR_NUM_THREADS` and `VECLIB_MAXIMUM_THREADS`, then restores the previous
@@ -561,7 +563,11 @@ each package requires its LICENSE file to be included.
   unset or invalid means `1` (cap on by default), `0` disables the cap (legacy behavior, for A/B testing),
   and a positive `N` pins `N` threads. Measured via this bridge from `hoops_ai_qt_sandbox` (14-core
   i9-13900H, 500 files, 14 workers), the single-thread cap cut Pass-1 wall time by roughly 7-10 % (same-day A/B: 439 s -> 407 s). The cap is scoped to
-  the `embed_shape_batch` call so the host's own FAISS/numpy search and shape-map work stay uncapped.
+  the `embed_shape_batch` call so the host's own FAISS/numpy search and shape-map work stay uncapped. The
+  effect is larger at high worker counts: on an AWS `g6.8xlarge` (16 physical / 32 logical, 121 GB, 10,715
+  TMCAD files) the cap let throughput keep rising to the logical core count — 32 workers finished in
+  1,504.2 s versus 3,377.6 s for the uncapped best (12 workers), a **2.25×** speedup — whereas without the
+  cap adding workers past ~12 only got slower.
 - **Per-file time budget.** `HoopsAI_AddCADFolderToIndex` takes a `timeLimitSeconds` argument that is passed
   to `embed_shape_batch` as the per-file size-bucket limits (`time_limit_small/medium/large`; `<= 0` keeps
   `hoops_ai`'s 120 s default). A heavy assembly that exceeds the budget is dropped with a *Timeout* and
@@ -569,7 +575,16 @@ each package requires its LICENSE file to be included.
   default budget (the many light files succeed), then pass 2 re-adds only the failed paths with a larger
   `timeLimitSeconds` and a small `numWorkers` (a single heavy file is not sped up by workers; only
   across-file parallelism helps). `time_limit_overall` is intentionally not set, to avoid imposing a
-  whole-batch cap.
+  whole-batch cap. Two related behaviors to keep in mind:
+  - **`hoops_ai`'s own heavy-file handling.** `hoops_ai` reserves 10 % of total RAM by default
+    (`min_available_ram_percent = 10`) and restarts a worker when free RAM falls below that; a file that
+    forces two or more restarts is flagged *heavy* and retried on a single worker with twice
+    `time_limit_large`. See the
+    [embed_shape_batch Specifications Guide](https://forum.techsoft3d.com/t/embed-shape-batch-specifications-guide/5153).
+  - **`timeLimitSeconds` is not enforced at `numWorkers = 1`.** Measured through this bridge, a single-worker
+    batch ran one file for 1,771 s to completion despite a 120 s budget — the per-file time limit did not
+    fire. So if you run pass 2 on a single worker, plan on files running to completion rather than being cut
+    off by the limit.
 - **Model loading is cached.** `HoopsAI_LoadMFRModel` / `HoopsAI_LoadEmbeddingsModel` construct the model
   and run `load_from_checkpoint` on the first call, then reuse it for the lifetime of the process.
 - **First import is slow.** Loading PyTorch takes a while; run it on a worker thread so it does not block
@@ -577,6 +592,15 @@ each package requires its LICENSE file to be included.
 - **Everything is serialized.** Every export is protected by a process-wide lock plus the GIL, so concurrent
   calls from multiple windows or documents queue rather than run in parallel. Thumbnail rendering can take
   several seconds per part, so keep add and search off the UI thread.
+- **Running a batch on a desktop PC.** Two things matter more on a workstation than on a server. First,
+  Windows 11 power throttling (EcoQoS): if the host application's window is hidden or minimized, Windows can
+  schedule the worker processes onto the efficiency cores and the batch slows down sharply — minimizing the
+  window made the same batch run about 60 % slower in `hoops_ai_qt_sandbox`. Keep the window in the
+  foreground, or run large batches on a dedicated machine. Second, **memory is the first constraint**, not
+  cores: the index build competes with everything else on the machine, so running other heavy work on the
+  same PC during a batch makes `hoops_ai` more likely to cross its RAM reserve and restart workers. On a
+  32 GB laptop the memory cap lands around 20 workers, which runs the machine at roughly 83–86 % CPU
+  utilization.
 
 ### Known limitations
 
@@ -602,6 +626,11 @@ application layer built on this should
   concepts.
 
 ## Licensing and redistribution rights
+
+The code in this repository is released under the [MIT License](LICENSE). That covers **only this
+repository's own source** — the Tech Soft 3D packages (`hoops_ai`, `hoops_exchange`, ...), the pretrained
+checkpoints, and any license key you embed are governed by your own agreement with Tech Soft 3D, not by the
+MIT License here.
 
 Everything above concerns what works technically. **Whether you may ship it is a separate question.**
 Whether Tech Soft 3D packages (`hoops_ai`, `hoops_exchange`, `hoops_converter`, `hoops_web_viewer`, ...),
